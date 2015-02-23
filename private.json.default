@@ -1,0 +1,7 @@
+{
+    "VPAPI_PWD_HU_ORSZAGGYULES": "secret",
+    "HU_ORSZAGGYULES_ACCESS_TOKEN": "request one at http://www.parlament.hu/w-api-tajekoztato",
+
+    "VPAPI_PWD_ME_SKUPSTINA": "secret",
+    "VPAPI_PWD_PL_SEJM": "secret"
+}
