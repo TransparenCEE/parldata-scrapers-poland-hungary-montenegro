@@ -7,17 +7,20 @@ from urlparse import urlparse, parse_qs, urljoin
 
 from urllib import urlencode
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+
+from w3lib.html import remove_tags
 
 import re
 
 from visegrad.spiders import VisegradSpider
 from visegrad.items import Person, Vote, VoteEvent, Organization, Membership,\
-    Motion, Count, Speech
+    Motion, Count, Speech, Event
 from visegrad.loaders import PersonLoader, ParlamentHuVoteLoader, ParlamentHuVoteEventLoader,\
     ParlamentHuOrganizationLoader, ParlamentHuMembershipLoader, ParlamentHuMotionLoader, \
-    CountLoader, ParlamentHuSpeechLoader
+    CountLoader, ParlamentHuSpeechLoader, ParlamentHuEventLoader
 from visegrad.api.parliaments import ParlamentHuApiExport
+from visegrad.utils import parse_hu_name
 
 
 def get_action_url(url):
@@ -52,6 +55,37 @@ kepviselocsoportjai-es-a-fuggetlen-kepviselok-1990-'
         PERSON_ENDPOINT,
     }
     VOTES_START_DATE = date(2014, 4, 26)
+
+    PARLIAMENTS_IDENTIFIERS = {
+        '2014-': {
+            'scheme': 'parlament.hu/chamber',
+            'identifier': '40'
+        },
+        '2010-2014': {
+            'scheme': 'parlament.hu/chamber',
+            'identifier': '39'
+        },
+        '2006-2010': {
+            'scheme': 'parlament.hu/chamber',
+            'identifier': '38'
+        },
+        '2002-2006': {
+            'scheme': 'parlament.hu/chamber',
+            'identifier': '37'
+        },
+        '1998-2002': {
+            'scheme': 'parlament.hu/chamber',
+            'identifier': '36'
+        },
+        '1994-98': {
+            'scheme': 'parlament.hu/chamber',
+            'identifier': '35'
+        },
+        '1990-94': {
+            'scheme': 'parlament.hu/chamber',
+            'identifier': '34'
+        }
+    }
 
     def start_requests(self):
         yield scrapy.Request(self.PARTIES_URL, callback=self.parse_parties)
@@ -91,10 +125,12 @@ kepviselocsoportjai-es-a-fuggetlen-kepviselok-1990-'
 
     def parse_commitee(self, response):
         query = parse_qs(urlparse(response.url).query)
-        committee_id = 'p_biz=%(p_biz)s&p_ckl=%(p_ckl)s' % dict(
+        query_dict = dict(
             (k.lower(), ''.join(v).upper())
             for k, v in query.iteritems()
         )
+        committee_id = 'p_biz=%(p_biz)s&p_ckl=%(p_ckl)s' % query_dict
+        year = query_dict['p_ckl']
 
         content = response.css('.pair-content')
 
@@ -107,6 +143,10 @@ kepviselocsoportjai-es-a-fuggetlen-kepviselok-1990-'
             'founding_date', u'.//tr[contains(td[1], "Létrehozás")]/td[2]/text()')
         l.add_xpath(
             'dissolution_date', u'.//tr[contains(td[1], "Megszűnés")]/td[2]/text()')
+        l.add_value('parent_id', {
+            'scheme': 'parlament.hu/chamber',
+            'identifier': year
+        })
         l.add_value('sources', [response.url])
         yield l.load_item()
 
@@ -144,6 +184,13 @@ kepviselocsoportjai-es-a-fuggetlen-kepviselok-1990-'
         l = PersonLoader(item=Person(), response=response,
             scheme='parlament.hu/people')
         pk = response.meta['p_azon']
+        name = response.xpath('//nev/text()').extract()[0]
+        splitted_name = parse_hu_name(name)
+        if 'given_name' in splitted_name and 'family_name' in splitted_name:
+            splitted_name['sort_name'] = \
+                '%(family_name)s, %(given_name)s' % splitted_name
+
+        l.add_value(None, splitted_name)
         l.add_value('identifiers', pk)
         l.add_xpath('name', '//nev/text()')
         l.add_xpath('email', '//email/text()')
@@ -195,6 +242,28 @@ kepv_adat?p_azon=%s' % pk
         l.add_css('image', 'img.kepviselo-foto::attr(src)')
         person = l.load_item()
 
+        terms_of_service = response.css('#valasztas').xpath(".//tr[td]")
+        if terms_of_service:
+            header = response.css('#valasztas').xpath(
+                './/tr[th][2]/th/text()').extract()
+            try:
+                year_index = header.index('Ciklus')
+                start_date_index = header.index(u'Mand\xe1tum kezdete')
+                end_date_index = header.index(u'Mand\xe1tum v\xe9ge')
+            except ValueError:
+                terms_of_service = []
+
+            for term in terms_of_service:
+                row = map(unicode.strip, term.css('td::text').extract())
+                parliament_id = self.PARLIAMENTS_IDENTIFIERS[row[year_index]]
+
+                m = ParlamentHuMembershipLoader(item=Membership())
+                m.add_value('person_id', person['identifiers'])
+                m.add_value('organization_id', parliament_id)
+                m.add_value('start_date', row[start_date_index])
+                m.add_value('end_date', row[end_date_index])
+                yield m.load_item()
+
         committees = response.css('#biz-tagsag').xpath('.//tr[td]')
         for committee in committees:
             url = committee.xpath('.//a/@href').extract()[0]
@@ -233,43 +302,81 @@ kepv_adat?p_azon=%s' % pk
 
     def parse_person_speeches(self, response):
         content = response.xpath('//table[3]')
-        pages = content.xpath('./tr[2]//a/@href').extract()
-        for page in pages:
+
+        sessions = content.xpath('./tr[1]//table//tr//td[1]//a')
+
+        stop_date = self.get_latest_speech_date()
+
+        for session in sessions:
+            dt = session.re(r'\d{4}\.\d{2}.\d{2}')
+            if dt:
+                dt = datetime.strptime(dt[0], '%Y.%m.%d').date()
+                if stop_date and dt < stop_date:
+                    raise StopIteration()
+            url = session.xpath('.//@href').extract()[0]
+            yield scrapy.Request(
+                urljoin(response.url, url),
+                callback=self.parse_session_speeches
+            )
+
+        next_page = content.xpath(
+            "./tr[2]//a[contains(text(), '>>')]/@href").extract()
+        for page in next_page:
             yield scrapy.Request(
                 urljoin(response.url, page),
                 callback=self.parse_person_speeches
             )
 
-        sessions = content.xpath(
-            './tr[1]//table//tr//td[1]//a/@href').extract()
-        for session in sessions:
-            yield scrapy.Request(
-                urljoin(response.url, session),
-                callback=self.parse_session_speeches
-            )
-
     def parse_session_speeches(self, response):
-        content = response.css('.pair-content table')
-        speeches = content.xpath('.//tr')
-        for speech in speeches:
-            url = speech.xpath('.//td[1]//a/@href').extract()
-            if url:
+        content = response.css('.pair-content')
+
+        query = parse_qs(urlparse(response.url).query)
+        query_dict = dict(
+            (k.lower(), ''.join(v).upper())
+            for k, v in query.iteritems()
+        )
+        session_id = '%(p_ckl)s_%(p_nap)s' % query_dict
+
+        l = ParlamentHuEventLoader(item=Event(type='session'), selector=content)
+        l.add_xpath('name', './/h1[not(@class)]/text()')
+        l.add_xpath('start_date', './/h1[not(@class)]/text()',
+                    re=r'\d{4}\.\d{2}.\d{2}\.')
+        l.add_value('identifier', session_id)
+        l.add_value('sources', response.url)
+
+        session = l.load_item()
+        yield session
+
+        sections = content.css('table')
+
+        for n, section in enumerate(sections):
+            sitting_id = '%s_%d' % (session_id, n)
+            l = ParlamentHuEventLoader(
+                item=Event(type='sitting'), selector=section)
+            l.add_xpath('name', './/tr[1]/th//text()')
+            l.add_value('identifier', sitting_id)
+            l.add_value('parent_id', session_id)
+            l.add_value('sources', response.url)
+            sitting = l.load_item()
+            yield sitting
+
+            speeches = section.xpath('.//tr[td[1][a]]')
+
+            for speech in speeches:
+                url = speech.xpath('.//td[1]//a/@href').extract()
                 yield scrapy.Request(
                     urljoin(response.url, url[0]),
                     callback=self.parse_speech,
                     meta={
                         'time': speech.xpath('.//td[5]/text()').re(
-                            r"\d{2}\:\d{2}\:\d{2}")
+                            r"\d{2}\:\d{2}\:\d{2}"),
+                        'event_id': sitting_id
                     }
                 )
 
     def parse_speech(self, response):
-        paragraphs = response.css('p[class^="P"]')
-        text = '\n'.join(
-            ''.join(
-                span.xpath('.//text()').extract()
-            ) for span in paragraphs
-        ).strip()
+        paragraphs = response.css('p')[:-1]  # last p contains pagination
+        text = remove_tags(''.join(paragraphs.extract()))
 
         l = ParlamentHuSpeechLoader(item=Speech(), selector=response,
             scheme='parlament.hu/people')
@@ -280,6 +387,7 @@ kepv_adat?p_azon=%s' % pk
         l.add_xpath('video', '//table//tr[6]//td[2]/a/@href')
         l.add_xpath('creator_id', '//table//tr[2]//td[2]/a/@href',
             re=r'ogy_kpv\.kepv_adat\?p_azon=(\w\d+)')
+        l.add_value('event_id', response.meta['event_id'])
 
         date = response.xpath(
             '//table//tr[1]/th/text()').re(r'\d{4}\.\d{2}.\d{2}\.')
@@ -306,14 +414,19 @@ kepv_adat?p_azon=%s' % pk
                 'p_datum_tol': start.strftime("%Y.%m.%d"),
                 'p_datum_ig': end.strftime("%Y.%m.%d")
             })
-        while start > self.VOTES_START_DATE:
+
+        stop_date = self.VOTES_START_DATE
+        if settings.get('CRAWL_LATEST_ONLY'):
+            stop_date = self.get_latest_vote_event_date() or stop_date
+
+        while start > stop_date:
             yield scrapy.Request(
                 get_votes_url(start, end), callback=self.parse_votes)
             end = start - timedelta(days = 1)
             start = end - timedelta(days = 60)
 
-        start = self.VOTES_START_DATE
-        if start < end:
+        start = stop_date
+        if start <= end:
             yield scrapy.Request(
                 get_votes_url(start, end), callback=self.parse_votes)
 

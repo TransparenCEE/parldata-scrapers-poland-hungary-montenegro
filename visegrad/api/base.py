@@ -16,6 +16,7 @@ class VisegradApiExport(object):
     domain = ''
     user = 'scraper'
     parliament_code = ''
+    single_chamber = True
     motions_ids = {}
     events_ids = {}
 
@@ -75,7 +76,10 @@ class VisegradApiExport(object):
         self.log('Exporting speeches', INFO)
         self.export_speeches()
 
-    def load_json(self, source):
+    def load_json(self, source, exclude=None):
+        if exclude is None:
+            exclude = lambda x: False
+
         filename = os.path.join(
             settings.get('OUTPUT_PATH', ''),
             self.domain,
@@ -84,18 +88,24 @@ class VisegradApiExport(object):
         if os.path.exists(filename):
             with open(filename, 'r') as f:
                 for line in f:
-                    yield json.loads(line.rstrip())
+                    item = json.loads(line.rstrip())
+                    if not exclude(item):
+                        yield item
 
-    def get_or_create(self, endpoint, item, refresh=False):
+    def get_or_create(self, endpoint, item, refresh=False, where_keys=None):
         sort = []
         embed = []
-        if endpoint == 'memberships':
+        where = {}
+        if where_keys:
+            for key in where_keys:
+                where[key] = item[key]
+        elif endpoint == 'memberships':
             where = {
                 'person_id': item['person_id'],
                 'organization_id': item['organization_id']
             }
-            if 'start_date' in item:
-                where['start_date'] = item['start_date']
+            where['start_date'] = item.get('start_date', {"$exists": False})
+
             sort = [('start_date', -1)]
         elif endpoint in ('motions', 'speeches'):
             where = {'sources.url': item['sources'][0]['url']}
@@ -116,13 +126,13 @@ class VisegradApiExport(object):
             where = {
                 'identifiers': {'$elemMatch': item['identifiers'][0]}}
         created = False
-        resp = vpapi.get(endpoint, where=where, sort=sort)
-        if not resp['_items']:
+        resp = vpapi.getfirst(endpoint, where=where, sort=sort)
+        if not resp:
             resp = vpapi.post(endpoint, item)
             created = True
             self.log('Created %s' % resp['_links']['self']['href'], DEBUG)
         else:
-            pk = resp['_items'][0]['id']
+            pk = resp['id']
             resp = vpapi.put("%s/%s" % (endpoint, pk), item)
             self.log('Updated %s' % resp['_links']['self']['href'], DEBUG)
 
@@ -163,12 +173,12 @@ class VisegradApiExport(object):
             self._ids[key] = item['id']
             return item['id']
 
-    def make_chamber(self):
+    def make_chamber(self, index):
         raise NotImplementedError()
 
-    def get_chamber(self):
+    def get_chamber(self, index=0):
         if not self._chamber:
-            self._chamber = self.make_chamber()
+            self._chamber = self.make_chamber(index)
         return self._chamber
 
     def export_people(self):
@@ -177,19 +187,26 @@ class VisegradApiExport(object):
 
         for person in people:
             resp = self.get_or_create('people', person)
-            membership = {
-                'person_id': resp['id'],
-                'organization_id': chamber['id']
-            }
-            self.get_or_create('memberships', membership)
+            if self.single_chamber:
+                membership = {
+                    'person_id': resp['id'],
+                    'organization_id': chamber['id']
+                }
+                self.get_or_create('memberships', membership)
 
     def export_organizations(self):
         chamber = self.get_chamber()
         organizations = self.load_json('organizations')
 
         for organization in organizations:
-            organization['parent_id'] = chamber['id']
-            resp = self.get_or_create('organizations', organization)
+            if self.single_chamber and 'parent_id' not in organization:
+                organization['parent_id'] = chamber['id']
+            elif 'parent_id' in organization:
+                organization['parent_id'] = self.get_remote_id(
+                    scheme=organization['parent_id']['scheme'],
+                    identifier=organization['parent_id']['identifier']
+                )
+            self.get_or_create('organizations', organization)
 
     def export_memberships(self):
         memberships = self.load_json('memberships')
@@ -208,10 +225,19 @@ class VisegradApiExport(object):
 
     def export_events(self):
         chamber = self.get_chamber()
-        events = self.load_json('events')
+        parent_events = self.load_json(
+            'events', exclude=lambda x: 'parent_id' in x)
+        child_events = self.load_json(
+            'events', exclude=lambda x: 'parent_id' not in x)
 
-        for item in events:
+        for item in parent_events:
             item['organization_id'] = chamber['id']
+            resp = self.get_or_create('events', item)
+            self.events_ids[item['identifier']] = resp['id']
+
+        for item in child_events:
+            item['organization_id'] = chamber['id']
+            item['parent_id'] = self.events_ids[item['parent_id']]
             resp = self.get_or_create('events', item)
             self.events_ids[item['identifier']] = resp['id']
 

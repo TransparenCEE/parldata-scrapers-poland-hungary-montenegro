@@ -1,6 +1,6 @@
 # -*- coding: utf8 -*-
 from scrapy.contrib.loader import ItemLoader
-from scrapy.contrib.loader.processor import TakeFirst, MapCompose
+from scrapy.contrib.loader.processor import TakeFirst, MapCompose, Compose
 
 from datetime import datetime
 
@@ -84,6 +84,14 @@ def pl_to_iso_datetime(d):
     if dt is None:
         return None
     return dt.strftime(DATETIME_FORMAT)
+
+
+def pl_make_session_id(value):
+    return 'sejm_posiedzenia/%s' % value
+
+
+def pl_make_sitting_id(value):
+    return 'sejm_posiedzenia_punkty/%s' % value
 
 
 class PersonLoader(ItemLoader):
@@ -202,6 +210,7 @@ class MojePanstwoMotionLoader(MotionLoader):
     date_in = MapCompose(pl_to_iso_datetime)
     result_in = MapCompose(lambda x: translate(
         x, MojePanstwoMotionLoader.VOTING_RESULTS))
+    legislative_session_id_in = MapCompose(strip, pl_make_session_id)
 
 
 class CountLoader(ItemLoader):
@@ -300,6 +309,25 @@ class EventLoader(ItemLoader):
 class MojePanstwoEventLoader(EventLoader):
     start_date_in = MapCompose(pl_to_iso_datetime)
     end_date_in = MapCompose(pl_to_iso_datetime)
+
+
+class MojePanstwoSessionLoader(MojePanstwoEventLoader):
+    identifier_in = MapCompose(strip, pl_make_session_id)
+
+
+class MojePanstwoSittingLoader(MojePanstwoEventLoader):
+    identifier_in = MapCompose(strip, pl_make_sitting_id)
+    parent_id_in = MapCompose(strip, pl_make_session_id)
+
+
+def join_text(value):
+    stripped = map(strip, value)
+    return ' '.join(filter(len, stripped))
+
+
+class ParlamentHuEventLoader(EventLoader):
+    name_in = Compose(join_text)
+    start_date_in = MapCompose(hu_to_iso_datetime)
 
 
 class SkupstinaMeEventLoader(EventLoader):
